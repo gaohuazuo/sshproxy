@@ -1,32 +1,54 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"syscall"
 
-	"myproxy/socks5"
+	"sshproxy/socks5"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
 
-type Socks5Config struct {
-	*socks5.DefConfig
-	dial func(string) (net.Conn, error)
-}
+type DummyResolver struct{}
 
-func (s *Socks5Config) DialTCP(addr string) (net.Conn, error) {
-	return s.dial(addr)
+func (*DummyResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
+	return ctx, net.IP{}, nil
 }
 
 func main() {
-	username := os.Getenv("USER")
+	listenaddr := flag.String("l", "127.0.0.1:1080", "listening address")
+	poolsize := flag.Uint("p", 1, "connection pool size")
+
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		fmt.Printf("Usage: %s [OPTIONS] remote\n", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	remoteurl, err := url.Parse("ssh://" + flag.Arg(0))
+	if err != nil {
+		log.Fatalf("failed to parse remote url %v\n", err)
+	}
+	if remoteurl.Port() == "" {
+		remoteurl.Host = net.JoinHostPort(remoteurl.Hostname(), "22")
+	}
+	username := remoteurl.User.Username()
+	if username == "" {
+		username = os.Getenv("USER")
+	}
+	// log.Printf("host is %s\n", remoteurl.Host)
+	// log.Printf("username is %s\n", username)
 	keypath := os.Getenv("HOME") + "/.ssh/id_rsa"
 	knownhosts_path := os.Getenv("HOME") + "/.ssh/known_hosts"
 
@@ -75,10 +97,9 @@ func main() {
 		err    error
 	}
 
-	poolsize := 10
-	reqchan := make([]chan int, poolsize)
-	respchan := make([]chan Resp, poolsize)
-	rngchan := make(chan int, poolsize)
+	reqchan := make([]chan int, *poolsize)
+	respchan := make([]chan Resp, *poolsize)
+	rngchan := make(chan int, *poolsize)
 
 	for i := range reqchan {
 		reqchan[i] = make(chan int)
@@ -91,12 +112,12 @@ func main() {
 				select {
 				case err := <-deadchan:
 					resp = Resp{err: err}
-					log.Printf("ssh connection dead due to: %v\n", err)
+					log.Printf("ssh connection died due to: %v\n", err)
 				default:
 				}
 				if resp.client == nil {
 					log.Println("trying to create new ssh connection")
-					client, err := ssh.Dial("tcp", "vultr-tokyo-1.qwwp.ml:22", sshconf)
+					client, err := ssh.Dial("tcp", remoteurl.Host, sshconf)
 					if err != nil {
 						log.Printf("ssh dial failed due to: %v\n", err)
 					} else {
@@ -112,29 +133,30 @@ func main() {
 
 	go func() {
 		for {
-			rngchan <- rand.Intn(poolsize)
+			rngchan <- rand.Intn(int(*poolsize))
 		}
 	}()
 
-	socks5Conf := &Socks5Config{
-		DefConfig: socks5.NewDefConfig(),
-		dial: func(addr string) (net.Conn, error) {
+	socks5Conf := &socks5.Config{
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			i := <-rngchan
-			log.Println("getting ssh connection from pool")
 			reqchan[i] <- 0
-			log.Println("request sent")
 			resp := <-respchan[i]
-			log.Println("got response")
 			if resp.err != nil {
 				return nil, resp.err
 			}
-			log.Println("creating ssh channel")
 			return resp.client.Dial("tcp", addr)
 		},
+		Resolver: &DummyResolver{},
 	}
-	socks5Conf.Port = "8080"
 
-	socksserver := socks5.NewSocks5Server(socks5Conf)
+	server, err := socks5.New(socks5Conf)
+	if err != nil {
+		panic(err)
+	}
 
-	socksserver.Listen()
+	log.Printf("socks5 server on %s\n", *listenaddr)
+	if err := server.ListenAndServe("tcp", *listenaddr); err != nil {
+		panic(err)
+	}
 }
